@@ -50,8 +50,19 @@ class TeamAssignment:
     blue_team_ids: List[int]
 
 
+@dataclass
+class TeamDestinations:
+    """Represent the most recent destination channels used for a voice channel."""
+
+    red_voice_id: int
+    blue_voice_id: int
+
+
 # Mapping of voice channel ID to the most recent team assignments.
 LAST_TEAM_ASSIGNMENTS: Dict[int, TeamAssignment] = {}
+
+# Mapping of voice channel ID to the destination channels used in /move_teams.
+LAST_TEAM_DESTINATIONS: Dict[int, TeamDestinations] = {}
 
 
 async def sync_application_commands(client: commands.Bot) -> None:
@@ -355,6 +366,118 @@ async def move_teams(
                 f"Skipped {len(skipped)} member(s) for the {team_name.lower()} team: "
                 + ", ".join(skipped)
             )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    LAST_TEAM_DESTINATIONS[current_channel.id] = TeamDestinations(
+        red_voice_id=red_voice.id,
+        blue_voice_id=blue_voice.id,
+    )
+
+
+@bot.tree.command(
+    name="reconvene",
+    description="Return the most recent teams from their channels back to your current channel.",
+)
+async def reconvene(interaction: discord.Interaction) -> None:
+    """Bring the last moved teams back into the caller's current voice channel."""
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used within a server.",
+            ephemeral=True,
+        )
+        return
+
+    target_channel = getattr(interaction.user.voice, "channel", None)
+
+    if target_channel is None:
+        await interaction.response.send_message(
+            "You must be in a voice channel to reconvene teams.",
+            ephemeral=True,
+        )
+        return
+
+    destinations = LAST_TEAM_DESTINATIONS.get(target_channel.id)
+
+    if destinations is None:
+        await interaction.response.send_message(
+            "No recent team moves found for this voice channel. Run /move_teams first.",
+            ephemeral=True,
+        )
+        return
+
+    red_channel = interaction.guild.get_channel(destinations.red_voice_id)
+    blue_channel = interaction.guild.get_channel(destinations.blue_voice_id)
+
+    for channel, colour in ((red_channel, "red"), (blue_channel, "blue")):
+        if not isinstance(channel, discord.VoiceChannel):
+            await interaction.response.send_message(
+                f"The {colour} team channel could not be found. Run /move_teams again.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    assignment = LAST_TEAM_ASSIGNMENTS.get(target_channel.id)
+
+    async def resolve_member(member_id: int) -> discord.Member | None:
+        member = interaction.guild.get_member(member_id)
+        if member is not None:
+            return member
+        try:
+            return await interaction.guild.fetch_member(member_id)
+        except discord.NotFound:
+            return None
+
+    async def move_back_member(member: discord.Member) -> tuple[str | None, str | None]:
+        if member.bot:
+            return None, None
+        if member.voice is None or member.voice.channel is None:
+            return None, f"{member.mention} (not in a voice channel)"
+        if member.voice.channel.id == target_channel.id:
+            return member.mention, None
+        try:
+            await member.move_to(target_channel)
+        except (discord.HTTPException, discord.Forbidden) as exc:
+            return None, f"{member.mention} (failed to move: {exc})"
+        else:
+            return member.mention, None
+
+    member_ids: set[int] = set()
+
+    if assignment is not None:
+        member_ids.update(assignment.red_team_ids)
+        member_ids.update(assignment.blue_team_ids)
+
+    for channel in (red_channel, blue_channel):
+        member_ids.update(member.id for member in channel.members if not member.bot)
+
+    moved_mentions: list[str] = []
+    skipped_messages: list[str] = []
+
+    for member_id in member_ids:
+        member = await resolve_member(member_id)
+        if member is None:
+            skipped_messages.append(f"<@{member_id}> (not found)")
+            continue
+
+        mention, skipped = await move_back_member(member)
+        if mention is not None:
+            moved_mentions.append(mention)
+        if skipped is not None:
+            skipped_messages.append(skipped)
+
+    lines = [
+        f"Moved {len(moved_mentions)} member(s) back to {target_channel.mention}."
+    ]
+
+    if skipped_messages:
+        lines.append(
+            f"Skipped {len(skipped_messages)} member(s): "
+            + ", ".join(skipped_messages)
+        )
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
