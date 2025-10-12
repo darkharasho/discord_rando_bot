@@ -11,7 +11,6 @@ from discord.ext import commands
 
 load_dotenv()
 TOKEN_ENV_VAR = "DISCORD_BOT_TOKEN"
-SYNC_GUILDS_ENV_VAR = "DISCORD_SYNC_GUILD_IDS"
 
 
 def get_token() -> str:
@@ -33,23 +32,6 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def parse_sync_guild_ids() -> list[int]:
-    """Return guild IDs from the environment for faster command registration."""
-    raw_ids = os.getenv(SYNC_GUILDS_ENV_VAR, "")
-    guild_ids: list[int] = []
-    for raw_id in raw_ids.split(","):
-        raw_id = raw_id.strip()
-        if not raw_id:
-            continue
-        try:
-            guild_ids.append(int(raw_id))
-        except ValueError as exc:  # pragma: no cover - defensive guard
-            raise RuntimeError(
-                f"Invalid guild ID '{raw_id}' in {SYNC_GUILDS_ENV_VAR}."
-            ) from exc
-    return guild_ids
-
-
 @bot.event
 async def on_ready() -> None:
     """Log readiness once Discord signals the client is ready."""
@@ -59,29 +41,23 @@ async def on_ready() -> None:
 
 
 async def sync_application_commands() -> None:
-    """Synchronize application commands according to the configured strategy."""
-    guild_ids = parse_sync_guild_ids()
-
-    if guild_ids:
-        available_guilds = {guild.id: guild for guild in bot.guilds}
-        missing_guilds: list[int] = []
-
-        for guild_id in guild_ids:
-            guild = available_guilds.get(guild_id)
-            if guild is None:
-                missing_guilds.append(guild_id)
-                continue
-            await bot.tree.sync(guild=guild)
-            print(f"Synced application commands for guild: {guild.name} ({guild.id})")
-
-        if missing_guilds:
-            print(
-                "Unable to sync commands for guild IDs: "
-                + ", ".join(str(guild_id) for guild_id in missing_guilds)
-            )
-    else:
+    """Synchronize application commands for all connected guilds."""
+    if not bot.guilds:
         await bot.tree.sync()
-        print("Synced global application commands.")
+        print("Synced global application commands (no guilds available yet).")
+        return
+
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=guild)
+        except discord.HTTPException as exc:
+            print(
+                f"Failed to sync application commands for guild: {guild.name} ({guild.id}) - {exc}"
+            )
+        else:
+            print(
+                f"Synced application commands for guild: {guild.name} ({guild.id})"
+            )
 
 
 @bot.event
