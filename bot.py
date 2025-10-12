@@ -51,25 +51,44 @@ def parse_sync_guild_ids() -> list[int]:
 
 
 @bot.event
-async def setup_hook() -> None:
-    """Register application commands globally or per guild before the bot becomes ready."""
+async def on_ready() -> None:
+    """Log readiness once Discord signals the client is ready."""
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    await sync_application_commands()
+
+
+async def sync_application_commands() -> None:
+    """Synchronize application commands according to the configured strategy."""
     guild_ids = parse_sync_guild_ids()
+
     if guild_ids:
+        available_guilds = {guild.id: guild for guild in bot.guilds}
+        missing_guilds: list[int] = []
+
         for guild_id in guild_ids:
-            await bot.tree.sync(guild=discord.Object(id=guild_id))
-        print(
-            "Synced application commands for guilds: "
-            + ", ".join(str(guild_id) for guild_id in guild_ids)
-        )
+            guild = available_guilds.get(guild_id)
+            if guild is None:
+                missing_guilds.append(guild_id)
+                continue
+            await bot.tree.sync(guild=guild)
+            print(f"Synced application commands for guild: {guild.name} ({guild.id})")
+
+        if missing_guilds:
+            print(
+                "Unable to sync commands for guild IDs: "
+                + ", ".join(str(guild_id) for guild_id in missing_guilds)
+            )
     else:
         await bot.tree.sync()
         print("Synced global application commands.")
 
 
 @bot.event
-async def on_ready() -> None:
-    """Log readiness once Discord signals the client is ready."""
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+async def on_guild_join(guild: discord.Guild) -> None:
+    """Ensure commands are available immediately after joining a new guild."""
+    await bot.tree.sync(guild=guild)
+    print(f"Synced application commands for newly joined guild: {guild.name} ({guild.id})")
 
 
 @bot.tree.command(name="random_winner", description="Pick a random member from your current voice channel")
