@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import random
 
+from dotenv import load_dotenv
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+load_dotenv()
 TOKEN_ENV_VAR = "DISCORD_BOT_TOKEN"
 
 

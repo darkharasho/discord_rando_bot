@@ -19,12 +19,19 @@ This project provides a minimal Discord bot with slash commands for randomizing 
 ## Installation
 1. Clone this repository and navigate into it.
 2. Install dependencies:
-
-   ```bash
+   ```
    pip install -r requirements.txt
    ```
 
-3. Create a `.env` file or export the `DISCORD_BOT_TOKEN` environment variable with your bot token.
+2. Create a `.env` file in the project directory:
+   ```
+   DISCORD_BOT_TOKEN=your_token_here
+   ```
+
+3. Run the bot:
+   ```
+   python bot.py
+   ```
 
 ## Running the bot
 
