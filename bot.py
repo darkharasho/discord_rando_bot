@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import random
+from dataclasses import dataclass
+from typing import Dict, List
 
 from dotenv import load_dotenv
 import discord
@@ -30,6 +32,18 @@ intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@dataclass
+class TeamAssignment:
+    """Represent the latest team assignment for a voice channel."""
+
+    red_team_ids: List[int]
+    blue_team_ids: List[int]
+
+
+# Mapping of voice channel ID to the most recent team assignments.
+LAST_TEAM_ASSIGNMENTS: Dict[int, TeamAssignment] = {}
 
 
 @bot.event
@@ -224,6 +238,117 @@ async def random_teams(
         embed.set_footer(text=f"{extra_colour} team received the extra player this round.")
 
     await interaction.response.send_message(embed=embed)
+
+    LAST_TEAM_ASSIGNMENTS[target_channel.id] = TeamAssignment(
+        red_team_ids=[member.id for member in red_team],
+        blue_team_ids=[member.id for member in blue_team],
+    )
+
+
+@bot.tree.command(
+    name="move_teams",
+    description="Move the last randomized teams into the specified voice channels.",
+)
+@app_commands.describe(
+    red_voice="Voice channel to move the red team into.",
+    blue_voice="Voice channel to move the blue team into.",
+)
+async def move_teams(
+    interaction: discord.Interaction,
+    red_voice: discord.VoiceChannel,
+    blue_voice: discord.VoiceChannel,
+) -> None:
+    """Move the previously randomized teams into the provided voice channels."""
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used within a server.",
+            ephemeral=True,
+        )
+        return
+
+    current_channel = getattr(interaction.user.voice, "channel", None)
+
+    if current_channel is None:
+        await interaction.response.send_message(
+            "You must be in a voice channel to move the teams.",
+            ephemeral=True,
+        )
+        return
+
+    if red_voice.guild.id != interaction.guild.id or blue_voice.guild.id != interaction.guild.id:
+        await interaction.response.send_message(
+            "Both destination channels must belong to this server.",
+            ephemeral=True,
+        )
+        return
+
+    assignment = LAST_TEAM_ASSIGNMENTS.get(current_channel.id)
+    if assignment is None:
+        await interaction.response.send_message(
+            "No team assignments found for this voice channel. Run /random_teams first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async def resolve_member(member_id: int) -> discord.Member | None:
+        member = interaction.guild.get_member(member_id)
+        if member is not None:
+            return member
+        try:
+            return await interaction.guild.fetch_member(member_id)
+        except discord.NotFound:
+            return None
+
+    async def move_members(
+        member_ids: List[int],
+        destination: discord.VoiceChannel,
+    ) -> tuple[list[str], list[str]]:
+        moved_mentions: list[str] = []
+        skipped_messages: list[str] = []
+
+        for member_id in member_ids:
+            member = await resolve_member(member_id)
+            if member is None:
+                skipped_messages.append(f"<@{member_id}> (not found)")
+                continue
+            if member.voice is None or member.voice.channel is None:
+                skipped_messages.append(f"{member.mention} (not in a voice channel)")
+                continue
+            if member.voice.channel.id == destination.id:
+                moved_mentions.append(member.mention)
+                continue
+            try:
+                await member.move_to(destination)
+            except (discord.HTTPException, discord.Forbidden) as exc:
+                skipped_messages.append(f"{member.mention} (failed to move: {exc})")
+            else:
+                moved_mentions.append(member.mention)
+
+        return moved_mentions, skipped_messages
+
+    team_results = []
+    for team_name, member_ids, channel in (
+        ("Red", assignment.red_team_ids, red_voice),
+        ("Blue", assignment.blue_team_ids, blue_voice),
+    ):
+        moved, skipped = await move_members(member_ids, channel)
+        team_results.append((team_name, channel, moved, skipped))
+
+    lines: list[str] = []
+    for team_name, channel, moved, skipped in team_results:
+        lines.append(
+            f"Moved {len(moved)} {team_name.lower()} team member(s) to {channel.mention}."
+        )
+        if skipped:
+            lines.append(
+                f"Skipped {len(skipped)} member(s) for the {team_name.lower()} team: "
+                + ", ".join(skipped)
+            )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 def main() -> None:
