@@ -11,6 +11,7 @@ from discord.ext import commands
 
 load_dotenv()
 TOKEN_ENV_VAR = "DISCORD_BOT_TOKEN"
+SYNC_GUILDS_ENV_VAR = "DISCORD_SYNC_GUILD_IDS"
 
 
 def get_token() -> str:
@@ -32,34 +33,60 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+def parse_sync_guild_ids() -> list[int]:
+    """Return guild IDs from the environment for faster command registration."""
+    raw_ids = os.getenv(SYNC_GUILDS_ENV_VAR, "")
+    guild_ids: list[int] = []
+    for raw_id in raw_ids.split(","):
+        raw_id = raw_id.strip()
+        if not raw_id:
+            continue
+        try:
+            guild_ids.append(int(raw_id))
+        except ValueError as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError(
+                f"Invalid guild ID '{raw_id}' in {SYNC_GUILDS_ENV_VAR}."
+            ) from exc
+    return guild_ids
+
+
+@bot.event
+async def setup_hook() -> None:
+    """Register application commands globally or per guild before the bot becomes ready."""
+    guild_ids = parse_sync_guild_ids()
+    if guild_ids:
+        for guild_id in guild_ids:
+            await bot.tree.sync(guild=discord.Object(id=guild_id))
+        print(
+            "Synced application commands for guilds: "
+            + ", ".join(str(guild_id) for guild_id in guild_ids)
+        )
+    else:
+        await bot.tree.sync()
+        print("Synced global application commands.")
+
+
 @bot.event
 async def on_ready() -> None:
-    """Log readiness and sync the application commands."""
-    await bot.tree.sync()
+    """Log readiness once Discord signals the client is ready."""
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-@bot.tree.command(name="random_winner", description="Pick a random member from a voice channel")
-@app_commands.describe(
-    channel="Voice channel to pick from. Defaults to your current channel.",
-    include_bots="Whether to include bots in the selection.",
-)
+@bot.tree.command(name="random_winner", description="Pick a random member from your current voice channel")
 async def random_winner(
     interaction: discord.Interaction,
-    channel: discord.VoiceChannel | None = None,
-    include_bots: bool = False,
 ) -> None:
     """Select a random user in the provided voice channel."""
-    target_channel = channel or getattr(interaction.user.voice, "channel", None)
+    target_channel = getattr(interaction.user.voice, "channel", None)
 
     if target_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel or specify one.",
+            "You must be in a voice channel to use this command.",
             ephemeral=True,
         )
         return
 
-    members = [member for member in target_channel.members if include_bots or not member.bot]
+    members = [member for member in target_channel.members if not member.bot]
 
     if not members:
         await interaction.response.send_message(
@@ -79,24 +106,20 @@ async def random_winner(
     description="Shuffle members in a voice channel into red and blue teams",
 )
 @app_commands.describe(
-    channel="Voice channel to draw teams from. Defaults to your current channel.",
-    include_bots="Whether to include bots in the team assignments.",
     red_captain="Optional member to designate as the red team captain.",
     blue_captain="Optional member to designate as the blue team captain.",
 )
 async def random_teams(
     interaction: discord.Interaction,
-    channel: discord.VoiceChannel | None = None,
-    include_bots: bool = False,
     red_captain: discord.Member | None = None,
     blue_captain: discord.Member | None = None,
 ) -> None:
     """Shuffle channel members into two evenly sized teams."""
-    target_channel = channel or getattr(interaction.user.voice, "channel", None)
+    target_channel = getattr(interaction.user.voice, "channel", None)
 
     if target_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel or specify one.",
+            "You must be in a voice channel to use this command.",
             ephemeral=True,
         )
         return
@@ -120,14 +143,14 @@ async def random_teams(
                 ephemeral=True,
             )
             return
-        if not include_bots and captain.bot:
+        if captain.bot:
             await interaction.response.send_message(
-                f"Bots cannot be captains unless include_bots is enabled.",
+                "Bots cannot be captains.",
                 ephemeral=True,
             )
             return
 
-    members = [member for member in target_channel.members if include_bots or not member.bot]
+    members = [member for member in target_channel.members if not member.bot]
 
     if len(members) < 2:
         await interaction.response.send_message(
