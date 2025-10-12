@@ -34,32 +34,54 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready() -> None:
-    """Log readiness and sync the application commands."""
-    await bot.tree.sync()
+    """Log readiness once Discord signals the client is ready."""
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+    await sync_application_commands()
 
-@bot.tree.command(name="random_winner", description="Pick a random member from a voice channel")
-@app_commands.describe(
-    channel="Voice channel to pick from. Defaults to your current channel.",
-    include_bots="Whether to include bots in the selection.",
-)
+
+async def sync_application_commands() -> None:
+    """Synchronize application commands for all connected guilds."""
+    if not bot.guilds:
+        await bot.tree.sync()
+        print("Synced global application commands (no guilds available yet).")
+        return
+
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=guild)
+        except discord.HTTPException as exc:
+            print(
+                f"Failed to sync application commands for guild: {guild.name} ({guild.id}) - {exc}"
+            )
+        else:
+            print(
+                f"Synced application commands for guild: {guild.name} ({guild.id})"
+            )
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    """Ensure commands are available immediately after joining a new guild."""
+    await bot.tree.sync(guild=guild)
+    print(f"Synced application commands for newly joined guild: {guild.name} ({guild.id})")
+
+
+@bot.tree.command(name="random_winner", description="Pick a random member from your current voice channel")
 async def random_winner(
     interaction: discord.Interaction,
-    channel: discord.VoiceChannel | None = None,
-    include_bots: bool = False,
 ) -> None:
     """Select a random user in the provided voice channel."""
-    target_channel = channel or getattr(interaction.user.voice, "channel", None)
+    target_channel = getattr(interaction.user.voice, "channel", None)
 
     if target_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel or specify one.",
+            "You must be in a voice channel to use this command.",
             ephemeral=True,
         )
         return
 
-    members = [member for member in target_channel.members if include_bots or not member.bot]
+    members = [member for member in target_channel.members if not member.bot]
 
     if not members:
         await interaction.response.send_message(
@@ -79,25 +101,51 @@ async def random_winner(
     description="Shuffle members in a voice channel into red and blue teams",
 )
 @app_commands.describe(
-    channel="Voice channel to draw teams from. Defaults to your current channel.",
-    include_bots="Whether to include bots in the team assignments.",
+    red_captain="Optional member to designate as the red team captain.",
+    blue_captain="Optional member to designate as the blue team captain.",
 )
 async def random_teams(
     interaction: discord.Interaction,
-    channel: discord.VoiceChannel | None = None,
-    include_bots: bool = False,
+    red_captain: discord.Member | None = None,
+    blue_captain: discord.Member | None = None,
 ) -> None:
     """Shuffle channel members into two evenly sized teams."""
-    target_channel = channel or getattr(interaction.user.voice, "channel", None)
+    target_channel = getattr(interaction.user.voice, "channel", None)
 
     if target_channel is None:
         await interaction.response.send_message(
-            "You must be in a voice channel or specify one.",
+            "You must be in a voice channel to use this command.",
             ephemeral=True,
         )
         return
 
-    members = [member for member in target_channel.members if include_bots or not member.bot]
+    if red_captain and red_captain == blue_captain:
+        await interaction.response.send_message(
+            "Red and blue captains must be different members.",
+            ephemeral=True,
+        )
+        return
+
+    for captain, colour in (
+        (red_captain, "red"),
+        (blue_captain, "blue"),
+    ):
+        if captain is None:
+            continue
+        if captain not in target_channel.members:
+            await interaction.response.send_message(
+                f"The {colour} team captain must be in {target_channel.mention}.",
+                ephemeral=True,
+            )
+            return
+        if captain.bot:
+            await interaction.response.send_message(
+                "Bots cannot be captains.",
+                ephemeral=True,
+            )
+            return
+
+    members = [member for member in target_channel.members if not member.bot]
 
     if len(members) < 2:
         await interaction.response.send_message(
@@ -109,8 +157,52 @@ async def random_teams(
     shuffled_members = members[:]
     random.shuffle(shuffled_members)
 
-    red_team = shuffled_members[::2]
-    blue_team = shuffled_members[1::2]
+    excluded_captain_ids = {
+        captain.id for captain in (red_captain, blue_captain) if captain is not None
+    }
+
+    remaining_members = [
+        member for member in shuffled_members if member.id not in excluded_captain_ids
+    ]
+
+    red_team = [red_captain] if red_captain else []
+    blue_team = [blue_captain] if blue_captain else []
+
+    total_members = len(members)
+    base_team_size = total_members // 2
+    extra_team: str | None = None
+    if total_members % 2 == 1:
+        extra_team = random.choice(["red", "blue"])
+
+    team_targets = {
+        "red": base_team_size + (1 if extra_team == "red" else 0),
+        "blue": base_team_size + (1 if extra_team == "blue" else 0),
+    }
+
+    for member in remaining_members:
+        possible_teams = [
+            team_name
+            for team_name, team_members in (("red", red_team), ("blue", blue_team))
+            if len(team_members) < team_targets[team_name]
+        ]
+        if possible_teams:
+            chosen_team = random.choice(possible_teams)
+        else:
+            chosen_team = "red" if len(red_team) <= len(blue_team) else "blue"
+        if chosen_team == "red":
+            red_team.append(member)
+        else:
+            blue_team.append(member)
+
+    def format_team_member(member: discord.Member, captain: discord.Member | None) -> str:
+        if captain and member.id == captain.id:
+            return f"⭐ {member.mention} (Captain)"
+        return member.mention
+
+    def build_team_field(team: list[discord.Member], captain: discord.Member | None) -> str:
+        if not team:
+            return "(none)"
+        return "\n".join(format_team_member(member, captain) for member in team)
 
     embed = discord.Embed(
         title=f"Random Teams for {target_channel.name}",
@@ -118,14 +210,18 @@ async def random_teams(
     )
     embed.add_field(
         name="🟥 Red Team",
-        value="\n".join(member.mention for member in red_team) or "(none)",
+        value=build_team_field(red_team, red_captain),
         inline=True,
     )
     embed.add_field(
         name="🟦 Blue Team",
-        value="\n".join(member.mention for member in blue_team) or "(none)",
+        value=build_team_field(blue_team, blue_captain),
         inline=True,
     )
+
+    if extra_team is not None:
+        extra_colour = "Red" if extra_team == "red" else "Blue"
+        embed.set_footer(text=f"{extra_colour} team received the extra player this round.")
 
     await interaction.response.send_message(embed=embed)
 
