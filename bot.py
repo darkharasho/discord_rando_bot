@@ -26,12 +26,20 @@ def get_token() -> str:
     return token
 
 
-intents = discord.Intents.default()
+intents = discord.Intents.all()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class TeamBot(commands.Bot):
+    """Custom bot implementation that synchronizes application commands."""
+
+    async def setup_hook(self) -> None:  # type: ignore[override]
+        await sync_application_commands(self)
+
+
+bot = TeamBot(command_prefix="!", intents=intents)
 
 
 @dataclass
@@ -46,24 +54,16 @@ class TeamAssignment:
 LAST_TEAM_ASSIGNMENTS: Dict[int, TeamAssignment] = {}
 
 
-@bot.event
-async def on_ready() -> None:
-    """Log readiness once Discord signals the client is ready."""
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-    await sync_application_commands()
-
-
-async def sync_application_commands() -> None:
+async def sync_application_commands(client: commands.Bot) -> None:
     """Synchronize application commands for all connected guilds."""
-    if not bot.guilds:
-        await bot.tree.sync()
+    if not client.guilds:
+        await client.tree.sync()
         print("Synced global application commands (no guilds available yet).")
         return
 
-    for guild in bot.guilds:
+    for guild in client.guilds:
         try:
-            await bot.tree.sync(guild=guild)
+            await client.tree.sync(guild=guild)
         except discord.HTTPException as exc:
             print(
                 f"Failed to sync application commands for guild: {guild.name} ({guild.id}) - {exc}"
@@ -72,6 +72,14 @@ async def sync_application_commands() -> None:
             print(
                 f"Synced application commands for guild: {guild.name} ({guild.id})"
             )
+
+
+@bot.event
+async def on_ready() -> None:
+    """Log readiness once Discord signals the client is ready."""
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    await sync_application_commands(bot)
 
 
 @bot.event
