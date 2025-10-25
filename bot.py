@@ -1,6 +1,7 @@
 """Discord bot that provides random voice channel utilities via slash commands."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -468,39 +469,73 @@ async def move_teams(
 
     await interaction.response.defer(ephemeral=True)
 
-    async def resolve_member(member_id: int) -> discord.Member | None:
-        member = interaction.guild.get_member(member_id)
-        if member is not None:
-            return member
-        try:
-            return await interaction.guild.fetch_member(member_id)
-        except discord.NotFound:
-            return None
+    fetch_semaphore = asyncio.Semaphore(5)
+    move_semaphore = asyncio.Semaphore(5)
+
+    async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
+        resolved: dict[int, discord.Member | None] = {}
+        missing: list[int] = []
+
+        for member_id in member_ids:
+            member = interaction.guild.get_member(member_id)
+            if member is not None:
+                resolved[member_id] = member
+            else:
+                missing.append(member_id)
+
+        if missing:
+            async def fetch_with_limit(member_id: int) -> discord.Member | None:
+                async with fetch_semaphore:
+                    try:
+                        return await interaction.guild.fetch_member(member_id)
+                    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                        return None
+
+            results = await asyncio.gather(
+                *(fetch_with_limit(member_id) for member_id in missing)
+            )
+            for member_id, member in zip(missing, results):
+                resolved[member_id] = member
+
+        return resolved
+
+    unique_member_ids = list({*assignment.red_team_ids, *assignment.blue_team_ids})
+    resolved_members = await resolve_members(unique_member_ids)
 
     async def move_members(
         member_ids: List[int],
         destination: discord.VoiceChannel,
     ) -> tuple[list[str], list[str]]:
+        async def process_member(
+            member_id: int,
+        ) -> tuple[str | None, str | None]:
+            member = resolved_members.get(member_id)
+            if member is None:
+                return None, f"<@{member_id}> (not found)"
+            if member.voice is None or member.voice.channel is None:
+                return None, f"{member.mention} (not in a voice channel)"
+            if member.voice.channel.id == destination.id:
+                return member.mention, None
+            async with move_semaphore:
+                try:
+                    await member.move_to(destination)
+                except (discord.HTTPException, discord.Forbidden) as exc:
+                    return None, f"{member.mention} (failed to move: {exc})"
+            return member.mention, None
+
+        tasks = [process_member(member_id) for member_id in dict.fromkeys(member_ids)]
+        if not tasks:
+            return [], []
+
+        results = await asyncio.gather(*tasks)
         moved_mentions: list[str] = []
         skipped_messages: list[str] = []
 
-        for member_id in member_ids:
-            member = await resolve_member(member_id)
-            if member is None:
-                skipped_messages.append(f"<@{member_id}> (not found)")
-                continue
-            if member.voice is None or member.voice.channel is None:
-                skipped_messages.append(f"{member.mention} (not in a voice channel)")
-                continue
-            if member.voice.channel.id == destination.id:
-                moved_mentions.append(member.mention)
-                continue
-            try:
-                await member.move_to(destination)
-            except (discord.HTTPException, discord.Forbidden) as exc:
-                skipped_messages.append(f"{member.mention} (failed to move: {exc})")
-            else:
-                moved_mentions.append(member.mention)
+        for moved, skipped in results:
+            if moved is not None:
+                moved_mentions.append(moved)
+            if skipped is not None:
+                skipped_messages.append(skipped)
 
         return moved_mentions, skipped_messages
 
