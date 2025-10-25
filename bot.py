@@ -13,7 +13,7 @@ from typing import Dict, List
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 load_dotenv()
 TOKEN_ENV_VAR = "DISCORD_BOT_TOKEN"
@@ -41,6 +41,8 @@ class TeamBot(commands.Bot):
 
     async def setup_hook(self) -> None:  # type: ignore[override]
         await sync_application_commands(self)
+        if not prune_team_state_loop.is_running():
+            prune_team_state_loop.start()
 
 
 bot = TeamBot(command_prefix="!", intents=intents)
@@ -214,6 +216,11 @@ def load_persisted_team_state() -> None:
 
 
 load_persisted_team_state()
+
+
+@tasks.loop(minutes=30)
+async def prune_team_state_loop() -> None:
+    prune_expired_entries()
 
 
 async def sync_application_commands(client: commands.Bot) -> None:
@@ -685,3 +692,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
