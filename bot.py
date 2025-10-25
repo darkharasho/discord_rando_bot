@@ -391,13 +391,15 @@ async def random_teams(
         title=f"Random Teams for {target_channel.name}",
         colour=discord.Colour.random(),
     )
+    red_count = len(red_team)
+    blue_count = len(blue_team)
     embed.add_field(
-        name="🟥 Red Team",
+        name=f"🟥 Red Team ({red_count})",
         value=build_team_field(red_team, red_captain),
         inline=True,
     )
     embed.add_field(
-        name="🟦 Blue Team",
+        name=f"🟦 Blue Team ({blue_count})",
         value=build_team_field(blue_team, blue_captain),
         inline=True,
     )
