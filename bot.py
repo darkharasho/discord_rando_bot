@@ -1,15 +1,19 @@
 """Discord bot that provides random voice channel utilities via slash commands."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import random
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 load_dotenv()
 TOKEN_ENV_VAR = "DISCORD_BOT_TOKEN"
@@ -37,6 +41,8 @@ class TeamBot(commands.Bot):
 
     async def setup_hook(self) -> None:  # type: ignore[override]
         await sync_application_commands(self)
+        if not prune_team_state_loop.is_running():
+            prune_team_state_loop.start()
 
 
 bot = TeamBot(command_prefix="!", intents=intents)
@@ -61,8 +67,160 @@ class TeamDestinations:
 # Mapping of voice channel ID to the most recent team assignments.
 LAST_TEAM_ASSIGNMENTS: Dict[int, TeamAssignment] = {}
 
+# Mapping of voice channel ID to when the assignment was last updated.
+LAST_TEAM_ASSIGNMENT_UPDATED: Dict[int, float] = {}
+
 # Mapping of voice channel ID to the destination channels used in /move_teams.
 LAST_TEAM_DESTINATIONS: Dict[int, TeamDestinations] = {}
+
+# Mapping of voice channel ID to when the destination entry was last updated.
+LAST_TEAM_DESTINATION_UPDATED: Dict[int, float] = {}
+
+# Persist team data to disk so the bot can survive restarts and longer downtimes.
+TEAM_STATE_FILE = Path(__file__).resolve().with_name("team_state.json")
+TEAM_STATE_VERSION = 1
+# Keep team information for one week before automatically pruning it.
+TEAM_STATE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def persist_team_state() -> None:
+    """Write team assignments and destinations to disk."""
+
+    data = {
+        "version": TEAM_STATE_VERSION,
+        "assignments": {
+            str(channel_id): {
+                "red_team_ids": assignment.red_team_ids,
+                "blue_team_ids": assignment.blue_team_ids,
+                "updated_at": LAST_TEAM_ASSIGNMENT_UPDATED[channel_id],
+            }
+            for channel_id, assignment in LAST_TEAM_ASSIGNMENTS.items()
+            if channel_id in LAST_TEAM_ASSIGNMENT_UPDATED
+        },
+        "destinations": {
+            str(channel_id): {
+                "red_voice_id": destinations.red_voice_id,
+                "blue_voice_id": destinations.blue_voice_id,
+                "updated_at": LAST_TEAM_DESTINATION_UPDATED[channel_id],
+            }
+            for channel_id, destinations in LAST_TEAM_DESTINATIONS.items()
+            if channel_id in LAST_TEAM_DESTINATION_UPDATED
+        },
+    }
+
+    tmp_path = TEAM_STATE_FILE.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+        tmp_path.replace(TEAM_STATE_FILE)
+    except OSError as exc:
+        print(f"Failed to persist team state: {exc}")
+
+
+def prune_expired_entries(*, now: float | None = None) -> None:
+    """Remove stale state entries that exceeded the retention window."""
+
+    current_time = time.time() if now is None else now
+    dirty = False
+
+    for channel_id, updated_at in list(LAST_TEAM_ASSIGNMENT_UPDATED.items()):
+        if current_time - updated_at > TEAM_STATE_TTL_SECONDS:
+            LAST_TEAM_ASSIGNMENTS.pop(channel_id, None)
+            LAST_TEAM_ASSIGNMENT_UPDATED.pop(channel_id, None)
+            dirty = True
+
+    for channel_id, updated_at in list(LAST_TEAM_DESTINATION_UPDATED.items()):
+        if current_time - updated_at > TEAM_STATE_TTL_SECONDS:
+            LAST_TEAM_DESTINATIONS.pop(channel_id, None)
+            LAST_TEAM_DESTINATION_UPDATED.pop(channel_id, None)
+            dirty = True
+
+    if dirty:
+        persist_team_state()
+
+
+def load_persisted_team_state() -> None:
+    """Load team state from disk, pruning any expired entries."""
+
+    if not TEAM_STATE_FILE.exists():
+        return
+
+    try:
+        raw_data = json.loads(TEAM_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Failed to load team state: {exc}")
+        return
+
+    version = raw_data.get("version")
+    if version != TEAM_STATE_VERSION:
+        print(
+            "Team state file version mismatch; ignoring persisted data. "
+            f"Found version {version}, expected {TEAM_STATE_VERSION}."
+        )
+        return
+
+    now = time.time()
+    dirty = False
+
+    assignments = raw_data.get("assignments", {})
+    for channel_id_str, record in assignments.items():
+        try:
+            channel_id = int(channel_id_str)
+            updated_at = float(record.get("updated_at"))
+        except (TypeError, ValueError):
+            dirty = True
+            continue
+
+        if now - updated_at > TEAM_STATE_TTL_SECONDS:
+            dirty = True
+            continue
+
+        try:
+            assignment = TeamAssignment(
+                red_team_ids=[int(member_id) for member_id in record["red_team_ids"]],
+                blue_team_ids=[int(member_id) for member_id in record["blue_team_ids"]],
+            )
+        except (KeyError, TypeError, ValueError):
+            dirty = True
+            continue
+
+        LAST_TEAM_ASSIGNMENTS[channel_id] = assignment
+        LAST_TEAM_ASSIGNMENT_UPDATED[channel_id] = updated_at
+
+    destinations = raw_data.get("destinations", {})
+    for channel_id_str, record in destinations.items():
+        try:
+            channel_id = int(channel_id_str)
+            updated_at = float(record.get("updated_at"))
+        except (TypeError, ValueError):
+            dirty = True
+            continue
+
+        if now - updated_at > TEAM_STATE_TTL_SECONDS:
+            dirty = True
+            continue
+
+        try:
+            destination = TeamDestinations(
+                red_voice_id=int(record["red_voice_id"]),
+                blue_voice_id=int(record["blue_voice_id"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            dirty = True
+            continue
+
+        LAST_TEAM_DESTINATIONS[channel_id] = destination
+        LAST_TEAM_DESTINATION_UPDATED[channel_id] = updated_at
+
+    if dirty:
+        persist_team_state()
+
+
+load_persisted_team_state()
+
+
+@tasks.loop(minutes=30)
+async def prune_team_state_loop() -> None:
+    prune_expired_entries()
 
 
 async def sync_application_commands(client: commands.Bot) -> None:
@@ -241,13 +399,15 @@ async def random_teams(
         title=f"Random Teams for {target_channel.name}",
         colour=discord.Colour.random(),
     )
+    red_count = len(red_team)
+    blue_count = len(blue_team)
     embed.add_field(
-        name="🟥 Red Team",
+        name=f"🟥 Red Team ({red_count})",
         value=build_team_field(red_team, red_captain),
         inline=True,
     )
     embed.add_field(
-        name="🟦 Blue Team",
+        name=f"🟦 Blue Team ({blue_count})",
         value=build_team_field(blue_team, blue_captain),
         inline=True,
     )
@@ -262,6 +422,8 @@ async def random_teams(
         red_team_ids=[member.id for member in red_team],
         blue_team_ids=[member.id for member in blue_team],
     )
+    LAST_TEAM_ASSIGNMENT_UPDATED[target_channel.id] = time.time()
+    persist_team_state()
 
 
 @bot.tree.command(
@@ -302,6 +464,8 @@ async def move_teams(
         )
         return
 
+    prune_expired_entries()
+
     assignment = LAST_TEAM_ASSIGNMENTS.get(current_channel.id)
     if assignment is None:
         await interaction.response.send_message(
@@ -312,39 +476,73 @@ async def move_teams(
 
     await interaction.response.defer(ephemeral=True)
 
-    async def resolve_member(member_id: int) -> discord.Member | None:
-        member = interaction.guild.get_member(member_id)
-        if member is not None:
-            return member
-        try:
-            return await interaction.guild.fetch_member(member_id)
-        except discord.NotFound:
-            return None
+    fetch_semaphore = asyncio.Semaphore(5)
+    move_semaphore = asyncio.Semaphore(5)
+
+    async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
+        resolved: dict[int, discord.Member | None] = {}
+        missing: list[int] = []
+
+        for member_id in member_ids:
+            member = interaction.guild.get_member(member_id)
+            if member is not None:
+                resolved[member_id] = member
+            else:
+                missing.append(member_id)
+
+        if missing:
+            async def fetch_with_limit(member_id: int) -> discord.Member | None:
+                async with fetch_semaphore:
+                    try:
+                        return await interaction.guild.fetch_member(member_id)
+                    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                        return None
+
+            results = await asyncio.gather(
+                *(fetch_with_limit(member_id) for member_id in missing)
+            )
+            for member_id, member in zip(missing, results):
+                resolved[member_id] = member
+
+        return resolved
+
+    unique_member_ids = list({*assignment.red_team_ids, *assignment.blue_team_ids})
+    resolved_members = await resolve_members(unique_member_ids)
 
     async def move_members(
         member_ids: List[int],
         destination: discord.VoiceChannel,
     ) -> tuple[list[str], list[str]]:
+        async def process_member(
+            member_id: int,
+        ) -> tuple[str | None, str | None]:
+            member = resolved_members.get(member_id)
+            if member is None:
+                return None, f"<@{member_id}> (not found)"
+            if member.voice is None or member.voice.channel is None:
+                return None, f"{member.mention} (not in a voice channel)"
+            if member.voice.channel.id == destination.id:
+                return member.mention, None
+            async with move_semaphore:
+                try:
+                    await member.move_to(destination)
+                except (discord.HTTPException, discord.Forbidden) as exc:
+                    return None, f"{member.mention} (failed to move: {exc})"
+            return member.mention, None
+
+        tasks = [process_member(member_id) for member_id in dict.fromkeys(member_ids)]
+        if not tasks:
+            return [], []
+
+        results = await asyncio.gather(*tasks)
         moved_mentions: list[str] = []
         skipped_messages: list[str] = []
 
-        for member_id in member_ids:
-            member = await resolve_member(member_id)
-            if member is None:
-                skipped_messages.append(f"<@{member_id}> (not found)")
-                continue
-            if member.voice is None or member.voice.channel is None:
-                skipped_messages.append(f"{member.mention} (not in a voice channel)")
-                continue
-            if member.voice.channel.id == destination.id:
-                moved_mentions.append(member.mention)
-                continue
-            try:
-                await member.move_to(destination)
-            except (discord.HTTPException, discord.Forbidden) as exc:
-                skipped_messages.append(f"{member.mention} (failed to move: {exc})")
-            else:
-                moved_mentions.append(member.mention)
+        for moved, skipped in results:
+            if moved is not None:
+                moved_mentions.append(moved)
+            if skipped is not None:
+                skipped_messages.append(skipped)
 
         return moved_mentions, skipped_messages
 
@@ -373,6 +571,8 @@ async def move_teams(
         red_voice_id=red_voice.id,
         blue_voice_id=blue_voice.id,
     )
+    LAST_TEAM_DESTINATION_UPDATED[current_channel.id] = time.time()
+    persist_team_state()
 
 
 @bot.tree.command(
@@ -397,6 +597,8 @@ async def reconvene(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+
+    prune_expired_entries()
 
     destinations = LAST_TEAM_DESTINATIONS.get(target_channel.id)
 
@@ -490,3 +692,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
