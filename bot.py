@@ -1,9 +1,12 @@
 """Discord bot that provides random voice channel utilities via slash commands."""
 from __future__ import annotations
 
+import json
 import os
 import random
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 from dotenv import load_dotenv
@@ -61,8 +64,155 @@ class TeamDestinations:
 # Mapping of voice channel ID to the most recent team assignments.
 LAST_TEAM_ASSIGNMENTS: Dict[int, TeamAssignment] = {}
 
+# Mapping of voice channel ID to when the assignment was last updated.
+LAST_TEAM_ASSIGNMENT_UPDATED: Dict[int, float] = {}
+
 # Mapping of voice channel ID to the destination channels used in /move_teams.
 LAST_TEAM_DESTINATIONS: Dict[int, TeamDestinations] = {}
+
+# Mapping of voice channel ID to when the destination entry was last updated.
+LAST_TEAM_DESTINATION_UPDATED: Dict[int, float] = {}
+
+# Persist team data to disk so the bot can survive restarts and longer downtimes.
+TEAM_STATE_FILE = Path(__file__).resolve().with_name("team_state.json")
+TEAM_STATE_VERSION = 1
+# Keep team information for one week before automatically pruning it.
+TEAM_STATE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def persist_team_state() -> None:
+    """Write team assignments and destinations to disk."""
+
+    data = {
+        "version": TEAM_STATE_VERSION,
+        "assignments": {
+            str(channel_id): {
+                "red_team_ids": assignment.red_team_ids,
+                "blue_team_ids": assignment.blue_team_ids,
+                "updated_at": LAST_TEAM_ASSIGNMENT_UPDATED[channel_id],
+            }
+            for channel_id, assignment in LAST_TEAM_ASSIGNMENTS.items()
+            if channel_id in LAST_TEAM_ASSIGNMENT_UPDATED
+        },
+        "destinations": {
+            str(channel_id): {
+                "red_voice_id": destinations.red_voice_id,
+                "blue_voice_id": destinations.blue_voice_id,
+                "updated_at": LAST_TEAM_DESTINATION_UPDATED[channel_id],
+            }
+            for channel_id, destinations in LAST_TEAM_DESTINATIONS.items()
+            if channel_id in LAST_TEAM_DESTINATION_UPDATED
+        },
+    }
+
+    tmp_path = TEAM_STATE_FILE.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+        tmp_path.replace(TEAM_STATE_FILE)
+    except OSError as exc:
+        print(f"Failed to persist team state: {exc}")
+
+
+def prune_expired_entries(*, now: float | None = None) -> None:
+    """Remove stale state entries that exceeded the retention window."""
+
+    current_time = time.time() if now is None else now
+    dirty = False
+
+    for channel_id, updated_at in list(LAST_TEAM_ASSIGNMENT_UPDATED.items()):
+        if current_time - updated_at > TEAM_STATE_TTL_SECONDS:
+            LAST_TEAM_ASSIGNMENTS.pop(channel_id, None)
+            LAST_TEAM_ASSIGNMENT_UPDATED.pop(channel_id, None)
+            dirty = True
+
+    for channel_id, updated_at in list(LAST_TEAM_DESTINATION_UPDATED.items()):
+        if current_time - updated_at > TEAM_STATE_TTL_SECONDS:
+            LAST_TEAM_DESTINATIONS.pop(channel_id, None)
+            LAST_TEAM_DESTINATION_UPDATED.pop(channel_id, None)
+            dirty = True
+
+    if dirty:
+        persist_team_state()
+
+
+def load_persisted_team_state() -> None:
+    """Load team state from disk, pruning any expired entries."""
+
+    if not TEAM_STATE_FILE.exists():
+        return
+
+    try:
+        raw_data = json.loads(TEAM_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Failed to load team state: {exc}")
+        return
+
+    version = raw_data.get("version")
+    if version != TEAM_STATE_VERSION:
+        print(
+            "Team state file version mismatch; ignoring persisted data. "
+            f"Found version {version}, expected {TEAM_STATE_VERSION}."
+        )
+        return
+
+    now = time.time()
+    dirty = False
+
+    assignments = raw_data.get("assignments", {})
+    for channel_id_str, record in assignments.items():
+        try:
+            channel_id = int(channel_id_str)
+            updated_at = float(record.get("updated_at"))
+        except (TypeError, ValueError):
+            dirty = True
+            continue
+
+        if now - updated_at > TEAM_STATE_TTL_SECONDS:
+            dirty = True
+            continue
+
+        try:
+            assignment = TeamAssignment(
+                red_team_ids=[int(member_id) for member_id in record["red_team_ids"]],
+                blue_team_ids=[int(member_id) for member_id in record["blue_team_ids"]],
+            )
+        except (KeyError, TypeError, ValueError):
+            dirty = True
+            continue
+
+        LAST_TEAM_ASSIGNMENTS[channel_id] = assignment
+        LAST_TEAM_ASSIGNMENT_UPDATED[channel_id] = updated_at
+
+    destinations = raw_data.get("destinations", {})
+    for channel_id_str, record in destinations.items():
+        try:
+            channel_id = int(channel_id_str)
+            updated_at = float(record.get("updated_at"))
+        except (TypeError, ValueError):
+            dirty = True
+            continue
+
+        if now - updated_at > TEAM_STATE_TTL_SECONDS:
+            dirty = True
+            continue
+
+        try:
+            destination = TeamDestinations(
+                red_voice_id=int(record["red_voice_id"]),
+                blue_voice_id=int(record["blue_voice_id"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            dirty = True
+            continue
+
+        LAST_TEAM_DESTINATIONS[channel_id] = destination
+        LAST_TEAM_DESTINATION_UPDATED[channel_id] = updated_at
+
+    if dirty:
+        persist_team_state()
+
+
+load_persisted_team_state()
 
 
 async def sync_application_commands(client: commands.Bot) -> None:
@@ -262,6 +412,8 @@ async def random_teams(
         red_team_ids=[member.id for member in red_team],
         blue_team_ids=[member.id for member in blue_team],
     )
+    LAST_TEAM_ASSIGNMENT_UPDATED[target_channel.id] = time.time()
+    persist_team_state()
 
 
 @bot.tree.command(
@@ -301,6 +453,8 @@ async def move_teams(
             ephemeral=True,
         )
         return
+
+    prune_expired_entries()
 
     assignment = LAST_TEAM_ASSIGNMENTS.get(current_channel.id)
     if assignment is None:
@@ -373,6 +527,8 @@ async def move_teams(
         red_voice_id=red_voice.id,
         blue_voice_id=blue_voice.id,
     )
+    LAST_TEAM_DESTINATION_UPDATED[current_channel.id] = time.time()
+    persist_team_state()
 
 
 @bot.tree.command(
@@ -397,6 +553,8 @@ async def reconvene(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+
+    prune_expired_entries()
 
     destinations = LAST_TEAM_DESTINATIONS.get(target_channel.id)
 
