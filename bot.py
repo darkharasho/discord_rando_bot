@@ -82,6 +82,9 @@ TEAM_STATE_VERSION = 1
 # Keep team information for one week before automatically pruning it.
 TEAM_STATE_TTL_SECONDS = 7 * 24 * 60 * 60
 
+# Delay between individual member moves to stay under Discord's rate limits.
+MEMBER_MOVE_DELAY_SECONDS = 0.5
+
 
 def persist_team_state() -> None:
     """Write team assignments and destinations to disk."""
@@ -528,6 +531,8 @@ async def move_teams(
                     await member.move_to(destination)
                 except (discord.HTTPException, discord.Forbidden) as exc:
                     return None, f"{member.mention} (failed to move: {exc})"
+                else:
+                    await asyncio.sleep(MEMBER_MOVE_DELAY_SECONDS)
             return member.mention, None
 
         tasks = [process_member(member_id) for member_id in dict.fromkeys(member_ids)]
