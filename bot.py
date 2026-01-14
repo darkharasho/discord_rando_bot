@@ -297,11 +297,13 @@ async def random_winner(
 @app_commands.describe(
     red_captain="Optional member to designate as the red team captain.",
     blue_captain="Optional member to designate as the blue team captain.",
+    include_caller="Whether to include the command caller in the randomized teams.",
 )
 async def random_teams(
     interaction: discord.Interaction,
     red_captain: discord.Member | None = None,
     blue_captain: discord.Member | None = None,
+    include_caller: bool = True,
 ) -> None:
     """Shuffle channel members into two evenly sized teams."""
     target_channel = getattr(interaction.user.voice, "channel", None)
@@ -316,6 +318,13 @@ async def random_teams(
     if red_captain and red_captain == blue_captain:
         await interaction.response.send_message(
             "Red and blue captains must be different members.",
+            ephemeral=True,
+        )
+        return
+
+    if not include_caller and interaction.user in (red_captain, blue_captain):
+        await interaction.response.send_message(
+            "You cannot exclude yourself while also being a team captain.",
             ephemeral=True,
         )
         return
@@ -339,7 +348,11 @@ async def random_teams(
             )
             return
 
-    members = [member for member in target_channel.members if not member.bot]
+    members = [
+        member
+        for member in target_channel.members
+        if not member.bot and (include_caller or member.id != interaction.user.id)
+    ]
 
     if len(members) < 2:
         await interaction.response.send_message(
@@ -697,5 +710,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
