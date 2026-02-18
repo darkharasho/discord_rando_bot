@@ -41,3 +41,24 @@ python bot.py
 ```
 
 Once the bot is running, invoke `/random_winner` or `/random_teams` in any guild where the bot is present. If you don't specify a voice channel, the bot will use your current one.
+
+## Move performance tuning
+
+The bot now supports environment variables for voice move throughput and retry behavior:
+
+- `MEMBER_FETCH_CONCURRENCY` (default: `8`): Parallel member fetches.
+- `MEMBER_MOVE_CONCURRENCY` (default: `8`): Parallel voice move requests.
+- `MEMBER_MOVE_DELAY_SECONDS` (default: `0`): Optional delay after each move. Keep at `0` for fastest moves.
+- `MEMBER_MOVE_MAX_RETRIES` (default: `3`): Retries for transient move failures.
+- `MEMBER_MOVE_RETRY_BASE_SECONDS` (default: `0.75`): Base backoff for retries.
+
+Example:
+
+```bash
+export MEMBER_FETCH_CONCURRENCY=8
+export MEMBER_MOVE_CONCURRENCY=10
+export MEMBER_MOVE_DELAY_SECONDS=0
+export MEMBER_MOVE_MAX_RETRIES=4
+export MEMBER_MOVE_RETRY_BASE_SECONDS=0.75
+python bot.py
+```

@@ -82,8 +82,64 @@ TEAM_STATE_VERSION = 1
 # Keep team information for one week before automatically pruning it.
 TEAM_STATE_TTL_SECONDS = 7 * 24 * 60 * 60
 
-# Delay between individual member moves to stay under Discord's rate limits.
-MEMBER_MOVE_DELAY_SECONDS = 0.5
+# Tune member fetch and move throughput without code changes.
+MEMBER_FETCH_CONCURRENCY = max(1, int(os.getenv("MEMBER_FETCH_CONCURRENCY", "8")))
+MEMBER_MOVE_CONCURRENCY = max(1, int(os.getenv("MEMBER_MOVE_CONCURRENCY", "8")))
+# Keep this at 0 for fastest moves, or set a small value (for example 0.05) if needed.
+MEMBER_MOVE_DELAY_SECONDS = max(0.0, float(os.getenv("MEMBER_MOVE_DELAY_SECONDS", "0")))
+MEMBER_MOVE_MAX_RETRIES = max(0, int(os.getenv("MEMBER_MOVE_MAX_RETRIES", "3")))
+MEMBER_MOVE_RETRY_BASE_SECONDS = max(
+    0.1, float(os.getenv("MEMBER_MOVE_RETRY_BASE_SECONDS", "0.75"))
+)
+RETRYABLE_MOVE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _get_retry_after_seconds(exc: discord.HTTPException) -> float | None:
+    """Attempt to read server-provided retry timing from an HTTP exception."""
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        return float(retry_after)
+
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    header_value = headers.get("Retry-After")
+    if header_value is None:
+        return None
+
+    try:
+        parsed = float(header_value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+async def move_member_with_retry(
+    member: discord.Member,
+    destination: discord.VoiceChannel,
+) -> None:
+    """Move a member with bounded retries for transient/rate-limit HTTP failures."""
+    attempt = 0
+    while True:
+        try:
+            await member.move_to(destination)
+            return
+        except discord.Forbidden:
+            raise
+        except discord.HTTPException as exc:
+            if (
+                exc.status not in RETRYABLE_MOVE_HTTP_STATUSES
+                or attempt >= MEMBER_MOVE_MAX_RETRIES
+            ):
+                raise
+
+            retry_after = _get_retry_after_seconds(exc)
+            backoff = MEMBER_MOVE_RETRY_BASE_SECONDS * (2**attempt)
+            delay = retry_after if retry_after is not None else backoff
+            await asyncio.sleep(min(max(delay, 0.1), 10.0))
+            attempt += 1
 
 
 def persist_team_state() -> None:
@@ -492,8 +548,8 @@ async def move_teams(
 
     await interaction.response.defer(ephemeral=True)
 
-    fetch_semaphore = asyncio.Semaphore(5)
-    move_semaphore = asyncio.Semaphore(5)
+    fetch_semaphore = asyncio.Semaphore(MEMBER_FETCH_CONCURRENCY)
+    move_semaphore = asyncio.Semaphore(MEMBER_MOVE_CONCURRENCY)
 
     async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
         resolved: dict[int, discord.Member | None] = {}
@@ -541,11 +597,11 @@ async def move_teams(
                 return member.mention, None
             async with move_semaphore:
                 try:
-                    await member.move_to(destination)
+                    await move_member_with_retry(member, destination)
                 except (discord.HTTPException, discord.Forbidden) as exc:
                     return None, f"{member.mention} (failed to move: {exc})"
-                else:
-                    await asyncio.sleep(MEMBER_MOVE_DELAY_SECONDS)
+            if MEMBER_MOVE_DELAY_SECONDS > 0:
+                await asyncio.sleep(MEMBER_MOVE_DELAY_SECONDS)
             return member.mention, None
 
         tasks = [process_member(member_id) for member_id in dict.fromkeys(member_ids)]
@@ -641,29 +697,35 @@ async def reconvene(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
 
     assignment = LAST_TEAM_ASSIGNMENTS.get(target_channel.id)
+    fetch_semaphore = asyncio.Semaphore(MEMBER_FETCH_CONCURRENCY)
+    move_semaphore = asyncio.Semaphore(MEMBER_MOVE_CONCURRENCY)
 
-    async def resolve_member(member_id: int) -> discord.Member | None:
-        member = interaction.guild.get_member(member_id)
-        if member is not None:
-            return member
-        try:
-            return await interaction.guild.fetch_member(member_id)
-        except discord.NotFound:
-            return None
+    async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
+        resolved: dict[int, discord.Member | None] = {}
+        missing: list[int] = []
 
-    async def move_back_member(member: discord.Member) -> tuple[str | None, str | None]:
-        if member.bot:
-            return None, None
-        if member.voice is None or member.voice.channel is None:
-            return None, f"{member.mention} (not in a voice channel)"
-        if member.voice.channel.id == target_channel.id:
-            return member.mention, None
-        try:
-            await member.move_to(target_channel)
-        except (discord.HTTPException, discord.Forbidden) as exc:
-            return None, f"{member.mention} (failed to move: {exc})"
-        else:
-            return member.mention, None
+        for member_id in member_ids:
+            member = interaction.guild.get_member(member_id)
+            if member is not None:
+                resolved[member_id] = member
+            else:
+                missing.append(member_id)
+
+        if missing:
+            async def fetch_with_limit(member_id: int) -> discord.Member | None:
+                async with fetch_semaphore:
+                    try:
+                        return await interaction.guild.fetch_member(member_id)
+                    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                        return None
+
+            results = await asyncio.gather(
+                *(fetch_with_limit(member_id) for member_id in missing)
+            )
+            for member_id, member in zip(missing, results):
+                resolved[member_id] = member
+
+        return resolved
 
     member_ids: set[int] = set()
 
@@ -674,16 +736,33 @@ async def reconvene(interaction: discord.Interaction) -> None:
     for channel in (red_channel, blue_channel):
         member_ids.update(member.id for member in channel.members if not member.bot)
 
+    resolved_members = await resolve_members(list(member_ids))
+
+    async def move_back_member(member_id: int) -> tuple[str | None, str | None]:
+        member = resolved_members.get(member_id)
+        if member is None:
+            return None, f"<@{member_id}> (not found)"
+        if member.bot:
+            return None, None
+        if member.voice is None or member.voice.channel is None:
+            return None, f"{member.mention} (not in a voice channel)"
+        if member.voice.channel.id == target_channel.id:
+            return member.mention, None
+
+        async with move_semaphore:
+            try:
+                await move_member_with_retry(member, target_channel)
+            except (discord.HTTPException, discord.Forbidden) as exc:
+                return None, f"{member.mention} (failed to move: {exc})"
+        if MEMBER_MOVE_DELAY_SECONDS > 0:
+            await asyncio.sleep(MEMBER_MOVE_DELAY_SECONDS)
+        return member.mention, None
+
+    results = await asyncio.gather(*(move_back_member(member_id) for member_id in member_ids))
+
     moved_mentions: list[str] = []
     skipped_messages: list[str] = []
-
-    for member_id in member_ids:
-        member = await resolve_member(member_id)
-        if member is None:
-            skipped_messages.append(f"<@{member_id}> (not found)")
-            continue
-
-        mention, skipped = await move_back_member(member)
+    for mention, skipped in results:
         if mention is not None:
             moved_mentions.append(mention)
         if skipped is not None:
@@ -710,4 +789,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
