@@ -91,7 +91,36 @@ MEMBER_MOVE_MAX_RETRIES = max(0, int(os.getenv("MEMBER_MOVE_MAX_RETRIES", "3")))
 MEMBER_MOVE_RETRY_BASE_SECONDS = max(
     0.1, float(os.getenv("MEMBER_MOVE_RETRY_BASE_SECONDS", "0.75"))
 )
+# Set to a positive number to smooth moves (for example 4.0 = 4 move requests/second).
+MEMBER_MOVE_TARGET_PER_SECOND = max(
+    0.0, float(os.getenv("MEMBER_MOVE_TARGET_PER_SECOND", "0"))
+)
 RETRYABLE_MOVE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+
+class MovePacer:
+    """Pace move requests so they are more evenly distributed over time."""
+
+    def __init__(self, rate_per_second: float) -> None:
+        self._interval = (1.0 / rate_per_second) if rate_per_second > 0 else 0.0
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    async def wait_turn(self) -> None:
+        if self._interval <= 0:
+            return
+
+        delay = 0.0
+        async with self._lock:
+            now = time.monotonic()
+            if self._next_allowed_at <= now:
+                self._next_allowed_at = now + self._interval
+            else:
+                delay = self._next_allowed_at - now
+                self._next_allowed_at += self._interval
+
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 def _get_retry_after_seconds(exc: discord.HTTPException) -> float | None:
@@ -119,11 +148,14 @@ def _get_retry_after_seconds(exc: discord.HTTPException) -> float | None:
 async def move_member_with_retry(
     member: discord.Member,
     destination: discord.VoiceChannel,
+    move_pacer: MovePacer | None = None,
 ) -> None:
     """Move a member with bounded retries for transient/rate-limit HTTP failures."""
     attempt = 0
     while True:
         try:
+            if move_pacer is not None:
+                await move_pacer.wait_turn()
             await member.move_to(destination)
             return
         except discord.Forbidden:
@@ -550,6 +582,7 @@ async def move_teams(
 
     fetch_semaphore = asyncio.Semaphore(MEMBER_FETCH_CONCURRENCY)
     move_semaphore = asyncio.Semaphore(MEMBER_MOVE_CONCURRENCY)
+    move_pacer = MovePacer(MEMBER_MOVE_TARGET_PER_SECOND)
 
     async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
         resolved: dict[int, discord.Member | None] = {}
@@ -597,7 +630,7 @@ async def move_teams(
                 return member.mention, None
             async with move_semaphore:
                 try:
-                    await move_member_with_retry(member, destination)
+                    await move_member_with_retry(member, destination, move_pacer=move_pacer)
                 except (discord.HTTPException, discord.Forbidden) as exc:
                     return None, f"{member.mention} (failed to move: {exc})"
             if MEMBER_MOVE_DELAY_SECONDS > 0:
@@ -699,6 +732,7 @@ async def reconvene(interaction: discord.Interaction) -> None:
     assignment = LAST_TEAM_ASSIGNMENTS.get(target_channel.id)
     fetch_semaphore = asyncio.Semaphore(MEMBER_FETCH_CONCURRENCY)
     move_semaphore = asyncio.Semaphore(MEMBER_MOVE_CONCURRENCY)
+    move_pacer = MovePacer(MEMBER_MOVE_TARGET_PER_SECOND)
 
     async def resolve_members(member_ids: list[int]) -> dict[int, discord.Member | None]:
         resolved: dict[int, discord.Member | None] = {}
@@ -751,7 +785,7 @@ async def reconvene(interaction: discord.Interaction) -> None:
 
         async with move_semaphore:
             try:
-                await move_member_with_retry(member, target_channel)
+                await move_member_with_retry(member, target_channel, move_pacer=move_pacer)
             except (discord.HTTPException, discord.Forbidden) as exc:
                 return None, f"{member.mention} (failed to move: {exc})"
         if MEMBER_MOVE_DELAY_SECONDS > 0:
